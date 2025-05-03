@@ -18,6 +18,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -44,6 +45,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -83,8 +85,26 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std += (2*self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
@@ -95,7 +115,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -132,7 +155,50 @@ class GPT(nn.Module):
         return model
 
 # ---------------------------------------
+import tiktoken
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        vocab_bpe_path    = "vocab.bpe"
+        encoder_json_path = "encoder.json"
+        mergeable_ranks = data_gym_to_mergeable_bpe_ranks(
+            vocab_bpe_file=vocab_bpe_path,
+            encoder_json_file=encoder_json_path
+        )
+        pat_str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"""
+        special_tokens = {"": 50256}
+        enc = Encoding(
+            name="gpt2",
+            explicit_n_vocab=50257,
+            pat_str=pat_str,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=special_tokens,
+        )
+        tokens = enc.encode(text, disallowed_special=(enc.special_tokens_set - {''}))
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch is out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
 # ---------------------------------------
 
 # Use CUDA if available, then MPS (for Apple silicon), otherwise fallback to CPU.
@@ -142,45 +208,37 @@ elif torch.backends.mps.is_available():
     device = torch.device('mps')
 else:
     device = torch.device('cpu')
+device = torch.device('cpu')
 print(f"Using device: {device}")
+# torch.backends.mps.matmul_precision = 'highest' 
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
-# Get a data batch.
-import tiktoken
-vocab_bpe_path    = "vocab.bpe"
-encoder_json_path = "encoder.json"
-mergeable_ranks = data_gym_to_mergeable_bpe_ranks(
-    vocab_bpe_file=vocab_bpe_path,
-    encoder_json_file=encoder_json_path
-)
-pat_str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"""
-special_tokens = {"": 50256}
-enc = Encoding(
-    name="gpt2",
-    explicit_n_vocab=50257,
-    pat_str=pat_str,
-    mergeable_ranks=mergeable_ranks,
-    special_tokens=special_tokens,
-)
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text, disallowed_special=(enc.special_tokens_set - {''}))
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-x = buf[:-1].view(B,T).to(device)
-y = buf[1:].view(B,T).to(device)
+train_loader = DataLoaderLite(B=4, T=32)
 
 # Get logits
 model = GPT(GPTConfig())
 # model.eval()
 model.to(device)
-logits = model(x)
+# logits, loss = model(x, y)
+
+# optimize!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x,y)
+    loss.backward()
+    optimizer.step()
+    print(f"Step {i}: Loss = {loss.item()}")
 
 
 
 
-print(logits.shape)
+# print(loss)
 import sys; sys.exit(0)
 
 
