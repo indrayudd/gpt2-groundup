@@ -245,7 +245,15 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=1, T=1024)
+total_batch_size = 524288 # power of 2
+B = 1 # micro
+T = 1024 # seq length
+assert total_batch_size % (B * T) == 0, "make sure total_batch size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"Total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 torch.set_float32_matmul_precision('high')
 # print("Float32 matmul precision is currently set to:", torch.get_float32_matmul_precision())
 
@@ -289,15 +297,20 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate =6e-4, de
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
+    
     optimizer.zero_grad()
-    if cast_dtype != torch.float32:
-        with torch.autocast(device_type=device.type, dtype=cast_dtype):
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)  
+        if cast_dtype != torch.float32:
+            with torch.autocast(device_type=device.type, dtype=cast_dtype):
+                logits, loss = model(x, y)
+        else:
             logits, loss = model(x, y)
-    else:
-        logits, loss = model(x, y)
-    loss.backward()
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determinig the learning rate for this iteration
     lr = get_lr(step)
@@ -309,9 +322,10 @@ for step in range(max_steps):
     elif device.type == 'mps':
         torch.mps.synchronize()
     t1 = time.time()
-    dt = (t1-t0)* 1000 # miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T)/(t1-t0)
-    print(f"Step {step}: Loss = {loss.item(): .5f}; lr: {lr: .4e} norm: {norm: .4f}; dt: {dt: .2f}ms; Token throughput: {tokens_per_sec :.1f}")
+    dt = (t1-t0) # seconds
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed/(t1-t0)
+    print(f"Step {step}: Loss = {loss_accum.item(): .5f}; lr: {lr: .4e} norm: {norm: .4f}; dt: {dt: .2f}ms; Token throughput: {tokens_per_sec :.1f}")
 
 
 
