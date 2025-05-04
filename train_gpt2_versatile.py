@@ -188,9 +188,11 @@ import tiktoken
 
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
@@ -216,7 +218,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -224,14 +226,16 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch is out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
+        if self.current_position + (B * T *self.num_processes + 1) > len(self.tokens):
             self.current_position = 0
         return x, y
 # ---------------------------------------
 
 from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # set up DDP (distributed data parallel).
 # torchrun command sets up the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -278,7 +282,7 @@ if master_process:
     print(f"Total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 torch.set_float32_matmul_precision('high')
 # print("Float32 matmul precision is currently set to:", torch.get_float32_matmul_precision())
 
@@ -289,6 +293,8 @@ model.to(device)
 # logits, loss = model(x, y)
 if device.type in ['cpu', 'cuda']:
     model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -335,7 +341,11 @@ for step in range(max_steps):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps-1)
         loss.backward()
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determinig the learning rate for this iteration
     lr = get_lr(step)
@@ -348,9 +358,14 @@ for step in range(max_steps):
         torch.mps.synchronize()
     t1 = time.time()
     dt = (t1-t0) # seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed/(t1-t0)
-    print(f"Step {step}: Loss = {loss_accum.item(): .5f}; lr: {lr: .4e} norm: {norm: .4f}; dt: {dt: .2f}s; Token throughput: {tokens_per_sec :.1f}")
+    if master_process:
+        print(f"Step {step:4d}| Loss = {loss_accum.item(): .5f} | lr: {lr: .4e} | norm: {norm: .4f} | dt: {dt: .2f}s | Token throughput: {tokens_per_sec :.1f}")
+    
+    if ddp:
+        destroy_process_group()
+    
 
 
 
@@ -363,27 +378,27 @@ import sys; sys.exit(0)
 
 
 
-print("Done encoding tokens!")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
+# print("Done encoding tokens!")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+# x = tokens.to(device)
 
-# Generate text; note that we remove the cuda manual seed calls.
-torch.manual_seed(42)
+# # Generate text; note that we remove the cuda manual seed calls.
+# torch.manual_seed(42)
 
-print("At the x.size(1) < max_length part...")
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, 1)
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x, xcol), dim=1)
+# print("At the x.size(1) < max_length part...")
+# while x.size(1) < max_length:
+#     with torch.no_grad():
+#         logits = model(x)
+#         logits = logits[:, -1, :]
+#         probs = F.softmax(logits, dim=-1)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         ix = torch.multinomial(topk_probs, 1)
+#         xcol = torch.gather(topk_indices, -1, ix)
+#         x = torch.cat((x, xcol), dim=1)
 
-print("Printing generated text...")
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# print("Printing generated text...")
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
