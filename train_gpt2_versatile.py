@@ -2,6 +2,7 @@ print("Sanity Print")
 
 from dataclasses import dataclass
 import math
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -31,13 +32,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return y  # Added return statement
+        return y 
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -216,24 +220,47 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=1, T=1024)
+torch.set_float32_matmul_precision('high')
+# print("Float32 matmul precision is currently set to:", torch.get_float32_matmul_precision())
 
 # Get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 # model.eval()
 model.to(device)
 # logits, loss = model(x, y)
+if device.type in ['cpu', 'cuda']:
+    model = torch.compile(model)
+
+if device.type == 'cuda':
+    cast_dtype = torch.bfloat16
+elif device.type == 'mps':
+    cast_dtype = torch.float16
+else:
+    cast_dtype = torch.float32
 
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x,y)
+    if cast_dtype != torch.float32:
+        with torch.autocast(device_type=device.type, dtype=cast_dtype):
+            logits, loss = model(x, y)
+    else:
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"Step {i}: Loss = {loss.item()}")
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    elif device.type == 'mps':
+        torch.mps.synchronize()
+    t1 = time.time()
+    dt = (t1-t0)* 1000 # miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T)/(t1-t0)
+    print(f"Step {i}: Loss = {loss.item()}, dt: {dt: .2f}ms; Token throughput: {tokens_per_sec :.1f}")
 
 
 
