@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from tiktoken.load import data_gym_to_mergeable_bpe_ranks
 from tiktoken.core import Encoding
-
+import inspect
 
 #-------------------------------------
 # (Configuration comments omitted for brevity...)
@@ -157,9 +157,34 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim grps. Any parameters that are 2D will be weight decayed, otherwise no.
+        # ie, all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nondecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nondecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params=sum(p.numel() for p in decay_params)
+        num_nondecay_params=sum(p.numel() for p in nondecay_params)
+        print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params: ,} parameters")
+        print(f"Num non-decayed parameter tensors: {len(nondecay_params)}, with {num_nondecay_params: ,} parameters")
+        # create AdamW optimizer and use fused version if available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device.type == 'cuda'
+        print(f"Using fused AdamW: {use_fused}")
+        optimizer=torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
 
 # ---------------------------------------
 import tiktoken
+
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -232,6 +257,11 @@ model.to(device)
 if device.type in ['cpu', 'cuda']:
     model = torch.compile(model)
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
 if device.type == 'cuda':
     cast_dtype = torch.bfloat16
 elif device.type == 'mps':
@@ -239,9 +269,25 @@ elif device.type == 'mps':
 else:
     cast_dtype = torch.float32
 
+def get_lr(it):
+    # 1. linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1)/warmup_steps
+    # 2. if it > lr.decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3. in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps)/(max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and foes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+# optimizer = torch.optim.AdamW(model.paramet_ers(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate =6e-4, device=device)
+
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -252,6 +298,11 @@ for i in range(50):
     else:
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determinig the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -260,7 +311,7 @@ for i in range(50):
     t1 = time.time()
     dt = (t1-t0)* 1000 # miliseconds
     tokens_per_sec = (train_loader.B * train_loader.T)/(t1-t0)
-    print(f"Step {i}: Loss = {loss.item()}, dt: {dt: .2f}ms; Token throughput: {tokens_per_sec :.1f}")
+    print(f"Step {step}: Loss = {loss.item(): .5f}; lr: {lr: .4e} norm: {norm: .4f}; dt: {dt: .2f}ms; Token throughput: {tokens_per_sec :.1f}")
 
 
 
