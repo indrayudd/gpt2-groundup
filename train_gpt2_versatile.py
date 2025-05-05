@@ -1,5 +1,3 @@
-print("Sanity Print")
-
 from dataclasses import dataclass
 import math
 import time
@@ -67,7 +65,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_2(x))
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -173,12 +171,13 @@ class GPT(nn.Module):
         ]
         num_decay_params=sum(p.numel() for p in decay_params)
         num_nondecay_params=sum(p.numel() for p in nondecay_params)
-        print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params: ,} parameters")
-        print(f"Num non-decayed parameter tensors: {len(nondecay_params)}, with {num_nondecay_params: ,} parameters")
         # create AdamW optimizer and use fused version if available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device.type == 'cuda'
-        print(f"Using fused AdamW: {use_fused}")
+        use_fused = fused_available and device.startswith("cuda")
+        if master_process:
+            print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params: ,} parameters")
+            print(f"Num non-decayed parameter tensors: {len(nondecay_params)}, with {num_nondecay_params: ,} parameters")
+            print(f"Using fused AdamW: {use_fused}")
         optimizer=torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
@@ -214,8 +213,9 @@ class DataLoaderLite:
         )
         tokens = enc.encode(text, disallowed_special=(enc.special_tokens_set - {''}))
         self.tokens = torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        if master_process:
+            print(f"Loaded {len(self.tokens)} tokens")
+            print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
         self.current_position = self.B * self.T * self.process_rank
@@ -265,7 +265,7 @@ else:
         device = torch.device('mps')
     else:
         device = torch.device('cpu')
-    device = torch.device('cpu')
+    # device = torch.device('cpu')
     print(f"Using device: {device}")
     # torch.backends.mps.matmul_precision = 'highest' 
 
@@ -274,7 +274,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288 # power of 2
-B = 1 # micro
+B = 16 # micro
 T = 1024 # seq length
 assert total_batch_size % (B * T) == 0, "make sure total_batch size is divisible by B * T * world size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -291,22 +291,29 @@ model = GPT(GPTConfig(vocab_size=50304))
 # model.eval()
 model.to(device)
 # logits, loss = model(x, y)
-if device.type in ['cpu', 'cuda']:
-    model = torch.compile(model)
+if not ddp:
+    if device.type in ['cpu', 'cuda']:
+        model = torch.compile(model)
+    raw_model = model
 if ddp:
+    model = torch.compile(model)
     model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
 max_steps = 50
 
-if device.type == 'cuda':
-    cast_dtype = torch.bfloat16
-elif device.type == 'mps':
-    cast_dtype = torch.float16
+if not ddp:
+    if device.type == 'cuda':
+        cast_dtype = torch.bfloat16
+    elif device.type == 'mps':
+        cast_dtype = torch.float16
+    else:
+        cast_dtype = torch.float32
 else:
-    cast_dtype = torch.float32
+    cast_dtype = torch.bfloat16
 
 def get_lr(it):
     # 1. linear warmup for warmup_iters steps
@@ -324,7 +331,7 @@ def get_lr(it):
 
 # optimize!
 # optimizer = torch.optim.AdamW(model.paramet_ers(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate =6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate =6e-4, device=device)
 
 for step in range(max_steps):
     t0 = time.time()
@@ -335,7 +342,8 @@ for step in range(max_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)  
         if cast_dtype != torch.float32:
-            with torch.autocast(device_type=device.type, dtype=cast_dtype):
+            device_type = device_type = "cuda" if device.startswith("cuda") else "mps"
+            with torch.autocast(device_type=device_type, dtype=cast_dtype):
                 logits, loss = model(x, y)
         else:
             logits, loss = model(x, y)
@@ -352,10 +360,13 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    if device.type == 'cuda':
+    if not ddp:
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        elif device.type == 'mps':
+            torch.mps.synchronize()
+    else:
         torch.cuda.synchronize()
-    elif device.type == 'mps':
-        torch.mps.synchronize()
     t1 = time.time()
     dt = (t1-t0) # seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
@@ -363,8 +374,8 @@ for step in range(max_steps):
     if master_process:
         print(f"Step {step:4d}| Loss = {loss_accum.item(): .5f} | lr: {lr: .4e} | norm: {norm: .4f} | dt: {dt: .2f}s | Token throughput: {tokens_per_sec :.1f}")
     
-    if ddp:
-        destroy_process_group()
+if ddp:
+    destroy_process_group()
     
 
 
