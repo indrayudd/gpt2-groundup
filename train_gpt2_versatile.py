@@ -345,6 +345,21 @@ if ckpt_files:
     print(f"Found checkpoint: {latest_ckpt}. Loading checkpoint...")
     checkpoint = torch.load(latest_ckpt, map_location=device)
     resume_step = checkpoint.get('step', 0) + 1
+    # --- restore RNG states if present ---
+    # PyTorch CPU RNG
+    if 'torch_rng_state' in checkpoint:
+        torch.set_rng_state(checkpoint['torch_rng_state'])
+    # PyTorch CUDA RNG (all devices)
+    if torch.cuda.is_available() and 'cuda_rng_state' in checkpoint:
+        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+    # NumPy RNG
+    if 'np_rng_state' in checkpoint:
+        np.random.set_state(checkpoint['np_rng_state'])
+    # Python `random` module RNG
+    if 'python_rng_state' in checkpoint:
+        import random
+        random.setstate(checkpoint['python_rng_state'])
+    # ----------------------------------------
     # Load configuration from the checkpoint if available, otherwise use default.
     config = checkpoint.get('config', GPTConfig(vocab_size=50304))
     model = GPT(config)
@@ -401,6 +416,8 @@ def get_lr(it):
 # optimize!
 # optimizer = torch.optim.AdamW(model.paramet_ers(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate =6e-4, device=device)
+if checkpoint is not None and 'optimizer' in checkpoint:
+    optimizer.load_state_dict(checkpoint['optimizer'])
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
