@@ -10,8 +10,12 @@ from tiktoken.core import Encoding
 import inspect
 import os
 import numpy as np
-from hellaswag import render_example, iterate_examples
-from cbt_eval import iterate_examples
+from hellaswag import render_example   as hs_render
+from hellaswag import iterate_examples as hs_iterate
+
+from cbt_eval  import render_example   as cbt_render
+from cbt_eval  import iterate_examples as cbt_iterate
+
 
 
 #-------------------------------------
@@ -325,7 +329,7 @@ enc = Encoding(
 
 
 total_batch_size = 524288 # power of 2
-B = 64 # micro
+B = 16 # micro
 T = 1024 # seq length
 assert total_batch_size % (B * T) == 0, "make sure total_batch size is divisible by B * T * world size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -342,8 +346,9 @@ torch.set_float32_matmul_precision('high')
 ckpt_files = glob.glob(os.path.join("log", "model_*.pt"))
 if ckpt_files:
     latest_ckpt = max(ckpt_files, key=lambda x: int(os.path.basename(x).split('_')[1].split('.')[0]))
-    print(f"Found checkpoint: {latest_ckpt}. Loading checkpoint...")
-    checkpoint = torch.load(latest_ckpt, map_location=device)
+    if master_process:
+        print(f"Found checkpoint: {latest_ckpt}. Loading checkpoint...")
+    checkpoint = torch.load(latest_ckpt, map_location="cpu")
     resume_step = checkpoint.get('step', 0) + 1
     # --- restore RNG states if present ---
     # PyTorch CPU RNG
@@ -351,7 +356,13 @@ if ckpt_files:
         torch.set_rng_state(checkpoint['torch_rng_state'])
     # PyTorch CUDA RNG (all devices)
     if torch.cuda.is_available() and 'cuda_rng_state' in checkpoint:
-        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+        saved_states = checkpoint['cuda_rng_state']
+        # make sure they're on CPU
+        saved_states = [st.cpu() for st in saved_states]
+        # slice to current device count
+        n_cuda = torch.cuda.device_count()
+        saved_states = saved_states[:n_cuda]
+        torch.cuda.set_rng_state_all(saved_states)
     # NumPy RNG
     if 'np_rng_state' in checkpoint:
         np.random.set_state(checkpoint['np_rng_state'])
@@ -359,11 +370,15 @@ if ckpt_files:
     if 'python_rng_state' in checkpoint:
         import random
         random.setstate(checkpoint['python_rng_state'])
+    if master_process:
+        print(f"Loaded RNG")
     # ----------------------------------------
     # Load configuration from the checkpoint if available, otherwise use default.
     config = checkpoint.get('config', GPTConfig(vocab_size=50304))
     model = GPT(config)
     model.load_state_dict(checkpoint['model'])
+    if master_process:
+        print(f"Loaded Model")
 else:
     checkpoint = None
     resume_step = 0
@@ -419,19 +434,41 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate =6e-4
 if checkpoint is not None and 'optimizer' in checkpoint:
     optimizer.load_state_dict(checkpoint['optimizer'])
 
+start_step = resume_step or 0
+
+
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
+if start_step > 0 and os.path.exists(log_file):
+    # keep only lines for steps < start_step
+    with open(log_file, "r") as f:
+        lines = f.readlines()
+    new_lines = []
+    for L in lines:
+        try:
+            step_i = int(L.split()[0])
+        except:
+            new_lines.append(L)  # keep headers or non-standard lines
+        else:
+            if step_i < start_step:
+                new_lines.append(L)
+    with open(log_file, "w") as f:
+        f.writelines(new_lines)
+    if master_process:
+        print(f"Truncated log.txt to only steps < {start_step}")
+else:
+    # fresh start
+    with open(log_file, "w"):
+        pass
 
 cbt_variant = "CN"     # or "NE","P","V"
 cbt_split   = "validation"
 cbt_every   = 250
 
 
-for step in range(max_steps):
+for step in range(resume_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
@@ -461,7 +498,7 @@ for step in range(max_steps):
             print(f"Validation Loss: {val_loss_accum.item(): .4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % 100 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
@@ -478,18 +515,19 @@ for step in range(max_steps):
                 if torch.cuda.is_available():
                     checkpoint['cuda_rng_state'] = torch.cuda.get_rng_state_all()
                 torch.save(checkpoint, checkpoint_path)
+                print("Chkpt Saved.")
 
     
     # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
+        for i, example in enumerate(hs_iterate("val")):
             # only process examples where i % ddp_world_size == ddp_rank
             if i % ddp_world_size != ddp_rank:
                 continue
             # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
+            _, tokens, mask, label = hs_render(example)
             tokens = tokens.to(device)
             mask = mask.to(device)
             # get the logits
@@ -522,11 +560,11 @@ for step in range(max_steps):
         num_total   = 0
 
         # iterate and shard across ddp ranks
-        for i, example in enumerate(iterate_examples(cbt_variant, cbt_split)):
+        for i, example in enumerate(cbt_iterate(cbt_variant, cbt_split)):
             if i % ddp_world_size != ddp_rank:
                 continue
             # render example → (data, tokens, mask, label)
-            _, tokens, mask, label = render_example(example)
+            _, tokens, mask, label = cbt_render(example)
             tokens = tokens.to(device)
             mask   = mask.to(device)
 
