@@ -207,39 +207,70 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         assert split in {'train', 'val'}
+        self.split = split
 
-        # get the shard filenames
+        # collect and sort your shards exactly as before
         data_root = 'tinystories'
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
+        shards = sorted([
+            os.path.join(data_root, fn)
+            for fn in os.listdir(data_root)
+            if split in fn
+        ])
+        assert shards, f"no shards found in {split}"
         self.shards = shards
-        assert len(shards) > 0, f"no shards found in {split}"
+
         if master_process:
-            print(f"found {len(shards)} shards for split")
+            print(f"found {len(self.shards)} shards for split={split}")
         self.reset()
 
     def reset(self):
+        # on every epoch/reset:
+        #   * shuffle shard order if training
+        #   * pick a random "stride-offset" so we still traverse the whole shard
+        if self.split == 'train':
+            random.shuffle(self.shards)
 
-        #state, init at shard zero
         self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+        self.tokens = load_tokens(self.shards[0])
 
+        # compute the stride = total tokens consumed per batch of all procs
+        stride = self.B * self.T * self.num_processes
+
+        if self.split == 'train':
+            # jitter only within [0, stride-1]
+            # and then each next_batch() simply walks forward by exactly stride
+            max_off = max(0, stride - 1)
+            self.current_position = random.randint(0, max_off)
+        else:
+            # keep your old deterministic split logic
+            self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position: self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the position in the tensor
+        buf = self.tokens[
+            self.current_position : self.current_position + B*T + 1
+        ]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
+        # advance by exactly one full stride
         self.current_position += B * T * self.num_processes
-        # if loading the next batch is out of bounds, reset
-        if self.current_position + (B * T *self.num_processes + 1) > len(self.tokens):
+
+        # if we ran out, go to next shard (and re‐jitter/re‐shuffle if train)
+        if self.current_position + (B*T*self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
+            if self.split == 'train':
+                # reshuffle shards next epoch
+                random.shuffle(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+
+            stride = B * T * self.num_processes
+            if self.split == 'train':
+                max_off = max(0, stride - 1)
+                self.current_position = random.randint(0, max_off)
+            else:
+                self.current_position = B * T * self.process_rank
+
         return x, y
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
