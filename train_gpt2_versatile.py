@@ -12,7 +12,7 @@ import os
 import numpy as np
 from hellaswag import render_example   as hs_render
 from hellaswag import iterate_examples as hs_iterate
-
+import random
 from cbt_eval  import render_example   as cbt_render
 from cbt_eval  import iterate_examples as cbt_iterate
 
@@ -305,6 +305,9 @@ import glob
 # set up DDP (distributed data parallel).
 # torchrun command sets up the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
+# create the log directory we will write checkpoints to and log to
+checkpoint_root = os.environ.get("CHECKPOINT_ROOT", "log")
+
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     # use of DDP atm demands CUD, we set the device appropriately according to rank
@@ -374,7 +377,7 @@ torch.set_float32_matmul_precision('high')
 # print("Float32 matmul precision is currently set to:", torch.get_float32_matmul_precision())
 
 # Check for the newest checkpoint in the log directory.
-ckpt_files = glob.glob(os.path.join("log", "model_*.pt"))
+ckpt_files = glob.glob(os.path.join(checkpoint_root, "model_*.pt"))
 if ckpt_files:
     latest_ckpt = max(ckpt_files, key=lambda x: int(os.path.basename(x).split('_')[1].split('.')[0]))
     if master_process:
@@ -433,7 +436,7 @@ if ddp:
 max_lr = 18e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 904 * 21
+max_steps = 904 * 21 * 9
 
 if not ddp:
     if device.type == 'cuda':
@@ -468,9 +471,9 @@ if checkpoint is not None and 'optimizer' in checkpoint:
 start_step = resume_step or 0
 
 
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
+
+log_dir = checkpoint_root
+
 log_file = os.path.join(log_dir, f"log.txt")
 if start_step > 0 and os.path.exists(log_file):
     # keep only lines for steps < start_step
@@ -529,7 +532,7 @@ for step in range(resume_step, max_steps):
             print(f"Validation Loss: {val_loss_accum.item(): .4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 100 == 0 or last_step):
+            if step > 0 and (step % 1000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
@@ -631,7 +634,7 @@ for step in range(resume_step, max_steps):
         model.eval()
         num_return_sequences = 4
         max_length = 32
-        tokens = enc.encode("Look up at the sky and see,", disallowed_special=(enc.special_tokens_set - {''}),)
+        tokens = enc.encode("Tausif grabbed the basket and told Indro,", disallowed_special=(enc.special_tokens_set - {''}),)
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
@@ -694,9 +697,12 @@ for step in range(resume_step, max_steps):
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determinig the learning rate for this iteration
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    if resume_step == 0:
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+    else:                                 # resumed run ➜ keep checkpoint LR
+        lr = optimizer.param_groups[0]['lr']  # just read it for logging
     optimizer.step()
     if not ddp:
         if device.type == 'cuda':
@@ -723,7 +729,3 @@ if ddp:
 
 # print(loss)
 import sys; sys.exit(0)
-
-
-
-
