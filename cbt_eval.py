@@ -1,3 +1,7 @@
+"""
+Evaluation Script for CBT-CN Eval
+"""
+
 import os
 import json
 import torch
