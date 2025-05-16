@@ -1,0 +1,8 @@
+# core numerics & tensors
+numpy>=1.23
+torch>=2.1          # includes torch.distributed and DDP
+# tokenisation & HF utilities
+tiktoken>=0.5.1
+transformers>=4.39  # used for GPT-2 weight loading
+# regex is a transient dep of tiktoken but pinning is often safer
+regex>=2023.12.25
