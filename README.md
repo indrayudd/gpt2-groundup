@@ -22,6 +22,7 @@ python train_gpt2_versatile.py
 # auto‑detects CUDA, Apple Silicon (MPS), or CPU
 # checkpoints + logs written to ./log/
 ```
+Optionally, download our trained model from [here](https://drive.google.com/file/d/1HMOaR_PZf2CuIjmu-nKb0T959bH4euo-/view?usp=sharing) with a UMD account.
 
 4. **Run inference**
 
